@@ -16,11 +16,29 @@ in the app (e.g. because a participant deleted their account or failed an age
 check) with a "visibility" of "hidden" or "invalid" rather than removing them
 from the responses entirely, so content can still be recovered from the Cache
 which the web app would not have shown the user.
+
+Roblox also has a separate private messaging service (distinct from platform
+chat - closer to email than instant messaging) served from the
+privatemessages.roblox.com host. The following endpoints are processed:
+
+* /v1/messages - paged listings of the signed-in user's messages. The
+  messageTab URL parameter identifies the folder (e.g. "inbox", "sent",
+  "archive"). Each entry includes sender/recipient details, subject and the
+  HTML message body.
+* /v1/messages/{id} - single message responses (same shape as a listing entry
+  without the collection wrapper).
+
+Message bodies are HTML; the plugin recovers a plain text version along with
+any links (anchor hrefs and bare URLs in the text - the latter is useful for
+surfacing scam/phishing links in user-sent messages).
 """
 import datetime
+import html
 import json
 import re
 import urllib.parse
+
+from html.parser import HTMLParser
 
 from mister_skinnylegs.util.artifact_utils import ArtifactResult, ArtifactSpec, LogFunction, ReportPresentation, ArtifactStorage
 from mister_skinnylegs.util.profile_folder_protocols import BrowserProfileProtocol
@@ -28,6 +46,9 @@ from mister_skinnylegs.util.profile_folder_protocols import BrowserProfileProtoc
 
 CONVERSATIONS_API_URL_PATTERN = re.compile(r"apis\.roblox\.com/platform-chat-api/v\d+/get-user-conversations")
 CONVERSATION_MESSAGES_API_URL_PATTERN = re.compile(r"apis\.roblox\.com/platform-chat-api/v\d+/get-conversation-messages")
+PRIVATE_MESSAGES_API_URL_PATTERN = re.compile(r"privatemessages\.roblox\.com/v\d+/messages")
+
+BARE_URL_PATTERN = re.compile(r"https?://[^\s<>\"']+")
 
 EPOCH = datetime.datetime(1970, 1, 1)
 
@@ -52,17 +73,23 @@ def _load_cache_json(cache_rec, log_func: LogFunction, endpoint: str):
         return None
 
 
+def _query_param(url: str, name: str):
+    """
+    Returns the first value of the named URL query parameter, or None.
+    """
+    try:
+        values = urllib.parse.parse_qs(urllib.parse.urlparse(url).query).get(name, [])
+        return values[0] if values else None
+    except ValueError:
+        return None
+
+
 def _conversation_id_from_url(url: str):
     """
     Extracts the conversation_id URL parameter from a get-conversation-messages
     cache key URL.
     """
-    try:
-        query = urllib.parse.urlparse(url).query
-        conversation_ids = urllib.parse.parse_qs(query).get("conversation_id", [])
-        return conversation_ids[0] if conversation_ids else None
-    except ValueError:
-        return None
+    return _query_param(url, "conversation_id")
 
 
 def _format_username(user_record: dict):
@@ -287,6 +314,135 @@ def get_chat_users(profile: BrowserProfileProtocol, log_func: LogFunction,
     return ArtifactResult(results)
 
 
+class _MessageBodyParser(HTMLParser):
+    """
+    Extracts plain text and link hrefs from a Roblox private message HTML body.
+    """
+    def __init__(self):
+        super().__init__(convert_charrefs=True)
+        self._chunks: list[str] = []
+        self.links: list[str] = []
+
+    def handle_data(self, data):
+        self._chunks.append(data)
+
+    def handle_starttag(self, tag, attrs):
+        if tag == "br":
+            self._chunks.append("\n")
+        elif tag == "a":
+            for attr_name, attr_value in attrs:
+                if attr_name.lower() == "href" and attr_value:
+                    self.links.append(attr_value)
+
+    @property
+    def text(self) -> str:
+        text = "".join(self._chunks)
+        text = re.sub(r"[ \t\r\f\v]+", " ", text)
+        text = re.sub(r" ?\n ?", "\n", text)
+        return text.strip()
+
+
+def _parse_message_body(body, log_func: LogFunction):
+    """
+    Converts a Roblox private message HTML body into (plain text, links).
+    Links are anchor hrefs plus any bare URLs in the text - user-sent messages
+    commonly contain bare URLs, some of which (e.g. "limited lookalike" scams)
+    are of particular forensic interest.
+    """
+    if not body:
+        return body, []
+    try:
+        parser = _MessageBodyParser()
+        parser.feed(body)
+        parser.close()
+        text = parser.text
+        links = list(dict.fromkeys(parser.links + BARE_URL_PATTERN.findall(text)))
+        return text, links
+    except Exception as e:
+        log_func(f"Warning: could not fully parse a Roblox private message body as HTML ({e}); "
+                 f"falling back to a basic tag strip.")
+        text = re.sub(r"[ \t\r\f\v]+", " ", html.unescape(re.sub(r"<[^>]*>", " ", body))).strip()
+        return text, list(dict.fromkeys(BARE_URL_PATTERN.findall(text)))
+
+
+def get_private_messages(profile: BrowserProfileProtocol, log_func: LogFunction,
+                         storage: ArtifactStorage) -> ArtifactResult:
+    results = []
+    # The same message can be recovered from multiple cached pages/fetches
+    # (message ids are unique across folders for the account); duplicates are
+    # collapsed and counted.
+    seen_messages = set()
+    duplicate_count = 0
+
+    def add_message(message, folder, page_number, source_endpoint: str, cache_rec):
+        nonlocal duplicate_count
+        if not isinstance(message, dict) or message.get("id") is None:
+            log_func(f"Warning: skipping unexpected message entry in Roblox {source_endpoint} "
+                     f"cache record: {cache_rec.data_location}")
+            return
+        message_key = str(message["id"])
+        if message_key in seen_messages:
+            duplicate_count += 1
+            return
+        seen_messages.add(message_key)
+
+        sender = message.get("sender") if isinstance(message.get("sender"), dict) else {}
+        recipient = message.get("recipient") if isinstance(message.get("recipient"), dict) else {}
+        body_text, links = _parse_message_body(message.get("body"), log_func)
+
+        results.append({
+            "message id": message.get("id"),
+            "folder": folder,
+            "page number": page_number,
+            "sender id": sender.get("id"),
+            "sender name": sender.get("name"),
+            "sender display name": sender.get("displayName"),
+            "sender verified": sender.get("hasVerifiedBadge"),
+            "recipient id": recipient.get("id"),
+            "recipient name": recipient.get("name"),
+            "recipient display name": recipient.get("displayName"),
+            "recipient verified": recipient.get("hasVerifiedBadge"),
+            "subject": message.get("subject"),
+            "body": body_text,
+            "links": ", ".join(links) if links else None,
+            "created": message.get("created"),
+            "updated": message.get("updated"),
+            "is read": message.get("isRead"),
+            "is system message": message.get("isSystemMessage"),
+            "is report abuse displayed": message.get("isReportAbuseDisplayed"),
+            "source endpoint": source_endpoint,
+            "cache url": cache_rec.key.url,
+            "data location": f"{cache_rec.data_location}",
+        })
+
+    for cache_rec in profile.iterate_cache(url=PRIVATE_MESSAGES_API_URL_PATTERN):
+        cache_data = _load_cache_json(cache_rec, log_func, "privatemessages")
+        if cache_data is None:
+            continue
+        folder = _query_param(cache_rec.key.url, "messageTab")
+        page_number = _query_param(cache_rec.key.url, "pageNumber")
+        if isinstance(cache_data, dict) and isinstance(cache_data.get("collection"), list):
+            # paged listing (messageTab=inbox/sent/archive)
+            messages = cache_data["collection"]
+            source_endpoint = "messages listing"
+        elif isinstance(cache_data, dict) and cache_data.get("id") is not None:
+            # single message response (e.g. /v1/messages/{id})
+            messages = [cache_data]
+            source_endpoint = "single message"
+        else:
+            log_func(f"Warning: unexpected structure in Roblox privatemessages cache record "
+                     f"(no collection list). Skipping: {cache_rec.data_location}")
+            continue
+        for message in messages:
+            add_message(message, folder, page_number, source_endpoint, cache_rec)
+
+    if duplicate_count:
+        log_func(f"Note: skipped {duplicate_count} duplicate Roblox private message record(s) already recovered from the Cache.")
+
+    results.sort(key=lambda r: (str(r["folder"]), str(r["created"]), str(r["message id"])))
+    return ArtifactResult(results)
+
+
 __artifacts__ = (
     ArtifactSpec(
         "Roblox",
@@ -310,6 +466,14 @@ __artifacts__ = (
         "Recovers Roblox chat participant details from get-user-conversations responses in the Cache",
         "0.1",
         get_chat_users,
+        ReportPresentation.table
+    ),
+    ArtifactSpec(
+        "Roblox",
+        "Roblox Private Messages",
+        "Recovers Roblox private messages (inbox/sent/archive) from privatemessages.roblox.com responses in the Cache",
+        "0.1",
+        get_private_messages,
         ReportPresentation.table
     ),
 )

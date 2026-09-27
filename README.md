@@ -41,6 +41,7 @@ plugins against a Chrome, Chromium or Mozilla Firefox Profile Folder.
 | roblox_plugin.py          | Roblox          | Roblox Chat Conversations             | 0.1     | Recovers Roblox platform chat conversations (threads) from get-user-conversations responses in the Cache  |
 | roblox_plugin.py          | Roblox          | Roblox Chat Messages                  | 0.1     | Recovers Roblox platform chat messages from get-conversation-messages (and conversation listing) responses in the Cache |
 | roblox_plugin.py          | Roblox          | Roblox Chat Users                     | 0.1     | Recovers Roblox chat participant details from get-user-conversations responses in the Cache               |
+| roblox_plugin.py          | Roblox          | Roblox Private Messages               | 0.1     | Recovers Roblox private messages (inbox, sent, archive) from privatemessages.roblox.com responses in the Cache |
 | storage_dump_plugin.py    | Data Dump       | History                               | 0.2     | Dumps History Records                                                                                     |
 | storage_dump_plugin.py    | Data Dump       | Downloads                             | 0.2     | Dumps Download Records                                                                                    |
 | storage_dump_plugin.py    | Data Dump       | Localstorage                          | 0.2     | Dumps Localstorage Records                                                                                |
