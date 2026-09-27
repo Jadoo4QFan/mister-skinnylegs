@@ -26,12 +26,26 @@ ENCODED_QUERY_PARAMS = ("gs_lp", "gs_lcp")
 ENCODED_QUERY_FIELD = 4
 ENCODED_CLIENT_FIELD = 2
 
-# Session storage values related to the Google search box store rows of
-# comma-separated fields beginning with a URL and (where present) a Unix
+# Google session storage values include the search box ("hsb;") records and
+# comma-separated rows beginning with a URL and (where present) a Unix
 # microsecond timestamp in the following field, e.g.
 #   https://www.google.com/search?...&q=...,1787847278737667,1,...
+# (the same row shape appears in other tools' session/tab exports, e.g. Safari
+# history exports converted from JSON to CSV - the timestamp and trailing
+# fields belong to the export row, not the URL itself).
 SESSION_SEARCH_URL_PATTERN = re.compile(r"https?://[^\s\"',;]+/search[^\s\"',;]*")
 SESSION_MICROS_PATTERN = re.compile(r",\s*(\d{16})\b")
+
+# Google Translate URLs:
+#   translate.google.<tld>/?hl=..&sl=..&tl=..&text=..&op=translate - the web UI
+#   translate.google.<tld>/translate?...&u=<url> - webpage translation requests
+#   translate.google.<tld>/#sl/tl/text - the legacy pre-2017 hash-based format
+#   translate.googleapis.com/translate_a/single|t|l?...&q=.. - the API calls
+#     made by the UI (their cached responses embed the translated output and
+#     the detected source language)
+TRANSLATE_URL_PATTERN = re.compile(r"https?://translate\.google(?:apis)?\.[A-Za-z.]+/")
+TRANSLATE_API_URL_PATTERN = re.compile(r"https?://translate\.googleapis\.com/translate_a/[a-z]+\?")
+TRANSLATE_HASH_URL_PATTERN = re.compile(r"#(?P<sl>[^#/]+)/(?P<tl>[^#/]+)/(?P<text>.+)$")
 
 
 def parse_unix_seconds(secs):
@@ -329,6 +343,131 @@ def google_search_urls(
     return ArtifactResult(results)
 
 
+def _get_translate_details(raw_url: str):
+    """
+    Parses a Google Translate URL (web UI, webpage translation, legacy
+    hash-based format, or translate_a API call) for the translation details.
+    Returns None for URLs which carry no translation content (e.g. the
+    Translate homepage).
+    """
+    url = urllib.parse.urlsplit(raw_url)
+    query = urllib.parse.parse_qs(url.query)
+
+    # the API carries the text in "q" (repeated for multi-segment texts)
+    q_values = query.get("q")
+    if q_values:
+        text = " ".join(q_values)
+    else:
+        text = query.get("text", [None])[0]
+
+    sl = query.get("sl", [None])[0]
+    tl = query.get("tl", [None])[0]
+    translated_page = query.get("u", [None])[0]
+
+    # legacy hash-based format: .../#sl/tl/text
+    if text is None:
+        hash_match = TRANSLATE_HASH_URL_PATTERN.search(raw_url)
+        if hash_match:
+            sl = sl or hash_match.group("sl")
+            tl = tl or hash_match.group("tl")
+            text = urllib.parse.unquote(hash_match.group("text"))
+
+    if not text and not translated_page:
+        return None
+
+    return {
+        "source text": text,
+        "source language": sl,
+        "target language": tl,
+        "detected source language": None,
+        "translated text": None,
+        "translated page (u)": translated_page,
+        "interface language": query.get("hl", [None])[0],
+        "operation": query.get("op", [None])[0],
+        "original url": raw_url,
+    }
+
+
+def _parse_translate_api_response(data: bytes, log_func: LogFunction, location) -> dict:
+    """
+    Extracts the translated text and detected source language from a cached
+    translate_a/single response body (a JSON array whose first element holds
+    the per-sentence translations and whose third element is the detected
+    source language, e.g. [[["Hola mundo!","Hello world!",null,null,10]
+    ],null,"en",...]). Returns a dict of the extractable fields.
+    """
+    details = {"translated text": None, "detected source language": None}
+    if not data:
+        return details
+    try:
+        parsed = json.loads(data.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as e:
+        log_func(f"Warning: could not parse a Google Translate API response ({e}). "
+                 f"Skipping content: {location}")
+        return details
+
+    if isinstance(parsed, list):
+        if parsed and isinstance(parsed[0], list):
+            sentences = [chunk[0] for chunk in parsed[0]
+                         if isinstance(chunk, list) and chunk and isinstance(chunk[0], str)]
+            if sentences:
+                details["translated text"] = " ".join(sentences)
+        if len(parsed) > 2 and isinstance(parsed[2], str):
+            details["detected source language"] = parsed[2]
+    return details
+
+
+def google_translate(profile: BrowserProfileProtocol, log_func: LogFunction,
+                     storage: ArtifactStorage) -> ArtifactResult:
+    """
+    Recovers Google Translate activity: what text was translated, between
+    which languages, which web pages were translated, and (where the API
+    responses survived in the Cache) the resulting translated text.
+    """
+    results = []
+
+    for history_rec in profile.iterate_history_records(url=TRANSLATE_URL_PATTERN):
+        details = _get_translate_details(history_rec.url)
+        if details is None:
+            continue
+        details.update({
+            "source": "History",
+            "timestamp": history_rec.visit_time,
+            "location": history_rec.record_location,
+        })
+        results.append(details)
+
+    for cache_rec in profile.iterate_cache(url=TRANSLATE_URL_PATTERN, omit_cached_data=True):
+        if TRANSLATE_API_URL_PATTERN.search(cache_rec.key.url):
+            continue  # reported from the API response loop below, with content
+        details = _get_translate_details(cache_rec.key.url)
+        if details is None:
+            continue
+        details.update({
+            "source": "Cache URLs",
+            "timestamp": cache_rec.metadata.request_time if cache_rec.metadata is not None else None,
+            "location": str(cache_rec.metadata_location),
+        })
+        results.append(details)
+
+    # Cached translate_a API responses carry the translated output itself
+    for cache_rec in profile.iterate_cache(url=TRANSLATE_API_URL_PATTERN):
+        details = _get_translate_details(cache_rec.key.url)
+        if details is None:
+            continue
+        details.update(_parse_translate_api_response(
+            cache_rec.data, log_func, cache_rec.data_location))
+        details.update({
+            "source": "Cache response",
+            "timestamp": cache_rec.metadata.request_time if cache_rec.metadata is not None else None,
+            "location": str(cache_rec.data_location),
+        })
+        results.append(details)
+
+    results.sort(key=lambda x: x["timestamp"] or datetime.datetime(1601, 1, 1))
+    return ArtifactResult(results)
+
+
 __artifacts__ = (
     ArtifactSpec(
         "Google",
@@ -348,6 +487,16 @@ __artifacts__ = (
         google_ai_mode_search_urls,
         ReportPresentation.table,
         timestamp_field_names=("timestamp", "ei session start timestamp", "sxsrf timestamp")
+    ),
+    ArtifactSpec(
+        "Google",
+        "Google Translate",
+        "Recovers Google Translate queries (source and target languages, translated text, "
+        "pages) from URLs in history and cache, and translated responses where cached",
+        "0.1",
+        google_translate,
+        ReportPresentation.table,
+        timestamp_field_names=("timestamp",)
     ),
 )
 

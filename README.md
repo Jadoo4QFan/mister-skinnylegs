@@ -36,6 +36,7 @@ plugins against a Chrome, Chromium or Mozilla Firefox Profile Folder.
 | google_drive_plugin.py    | Google Drive    | Google Drive Usage                    | 0.2     | Recovers indications of Google Drive usage                                                                |
 | google_plugin.py          | Google          | Google searches                       | 0.5     | Recovers google searches from URLs in history, session storage, cache                                     |
 | google_plugin.py          | Google          | Google AI Mode searches               | 0.1     | Recovers Google AI Mode searches and encoded query data (mq follow-ups, base64 gs_lp/gs_lcp query blobs, embedded timestamps) |
+| google_plugin.py          | Google          | Google Translate                      | 0.1     | Recovers Google Translate queries (languages, text, pages) from history and cache, and translated responses where cached |
 | o365_sharepoint_plugin.py | O365-Sharepoint | O365-Sharepoint recent files          | 0.2     | Recovers recent files list and any thumbnails from API responses in the cache for Sharepoint and O365     |
 | o365_sharepoint_plugin.py | O365-Sharepoint | O365-Sharepoint user activity         | 0.2     | Recovers artifacts related to user activity (viewing, editing, downloading, etc.) for Sharepoint and O365 |
 | reddit_plugin.py          | Reddit          | Reddit Chat Messages                  | 0.2     | Recovers Reddit chat messages from the Cache and IndexedDB                                                |
