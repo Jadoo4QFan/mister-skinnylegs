@@ -25,10 +25,23 @@ blocked.<region>.linewize.net, securly.com/blocked and block.si/block.php):
     &ver=...&extension_id=...&lat=...&lng=...
     (older blocked.php variant: ?gnp=1&reason=domainblockedforuser&url=<domain>)
 * BlockSi:     www.block.si/block.php?url=<domain>&category=<code>[&bwlist=<code>]
+* Microsoft Family Safety:
+    sdx.microsoft.com/family/restricted-web[-email[2]]
+    [?url=<percent-encoded blocked url>][&c=<category>][&theme=<Light|Dark>]
+    [&t=<Microsoft auth token>] - bare /family/restricted-web captures exist
+    too; other sdx paths (e.g. /auth/...) are service pages, not block pages
+* eero:        blocked.eero.com/?url=<percent-encoded blocked url>&referer=...
+    &reason=<e.g. ", PHISHING">&reasoncode=&timebound=&action=deny&kind=
+    &rule=&cat=&user=&zsq= (most fields are empty in the archived captures)
+* Circle:      filter.meetcircle.com/<profile>/?filtered=<domain>
+    &cat=<category name>&catid=<code>&reason=blocked, where <profile> is
+    adults, kids or teen (category names are localised, e.g. "Redes sociales")
 
-Hosts for other vendors (Microsoft Family Safety sdx.microsoft.com,
-Lightspeed Filter, eero, Circle) are recognised by name, and unknown vendors
-fall back to generic parameter extraction.
+Lightspeed Filter block pages are served from district-local appliances and
+have no archived captures under lightspeedsystems.com (blocklist/block/
+blocked/filter subdomains are all empty in the Internet Archive CDX as of
+2026-09), so those hosts are recognised by name only and decoded with the
+generic fallback.
 """
 import base64
 import binascii
@@ -57,6 +70,21 @@ BLOCK_HOST_PREFIXES = ("blocked.", "filter.")
 BLOCK_PATH_SUBSTRING = "/blocked"  # covers /blocked and /blocked.php
 BLOCK_PATHS = ("/block", "/block.php")
 
+# Where a vendor's domain is broader than its block page host, the archived
+# captures pin the block page to specific hosts. A domain match alone (e.g.
+# www.eero.com marketing pages) must NOT be treated as a block page.
+VENDOR_BLOCK_HOST_PREFIXES = {
+    "Lightspeed Filter": ("blocked.", "filter.", "blocklist."),
+    "eero": ("blocked.",),          # blocked.eero.com/?url=... (archived 2018)
+    "Circle": ("filter.",),         # filter.meetcircle.com/<profile>/ (archived 2018-2026)
+}
+
+# Block page path per vendor where the captured evidence pins one down (other
+# paths on the same host are service pages, not block pages).
+VENDOR_BLOCK_PATH_PREFIXES = {
+    "Microsoft Family Safety": ("/family/restricted-web",),
+}
+
 EPOCH = datetime.datetime(1970, 1, 1)
 
 
@@ -78,8 +106,15 @@ def _is_block_page(url: str):
     host = (parts.hostname or "").lower()
     path = parts.path or ""
 
-    if _vendor_for_host(host) is not None:
-        return _vendor_for_host(host)
+    vendor = _vendor_for_host(host)
+    if vendor is not None:
+        required_host_prefixes = VENDOR_BLOCK_HOST_PREFIXES.get(vendor)
+        if required_host_prefixes is not None and not host.startswith(required_host_prefixes):
+            return False
+        required_paths = VENDOR_BLOCK_PATH_PREFIXES.get(vendor)
+        if required_paths is None or any(path.startswith(prefix) for prefix in required_paths):
+            return vendor
+        return False
     if host.startswith(BLOCK_HOST_PREFIXES):
         return None
     if BLOCK_PATH_SUBSTRING in path or path in BLOCK_PATHS:
@@ -274,6 +309,82 @@ def _decode_blocksi(url: str, params: dict) -> dict:
     }
 
 
+def _decode_microsoft_family_safety(url: str, params: dict) -> dict:
+    # sdx.microsoft.com/family/restricted-web[-email[2]] captures: the blocked
+    # target rides in the url parameter, c carries a category code, theme the
+    # page theme, and t a long Microsoft auth token (kept truncated - it is
+    # not forensically meaningful beyond its presence)
+    token = _first_param(params, ("t",))
+    if token:
+        token = f"{token[:40]}... (len {len(token)})"
+    return {
+        "blocked url or domain": _first_param(params, ("url",)),
+        "category or reason": _first_param(params, ("c",)),
+        "user": None,
+        "rule/policy name": None,
+        "rule/policy id": None,
+        "device id": None,
+        "keyword": None,
+        "blocked path/query": None,
+        "other decoded context": _join_context(
+            ("theme", _first_param(params, ("theme",))),
+            ("auth token (t)", token),
+        ),
+    }
+
+
+def _decode_eero(url: str, params: dict) -> dict:
+    # blocked.eero.com captures: url is the percent-encoded blocked target,
+    # reason and cat repeat the blocking reason (", PHISHING"), action is
+    # deny, and the remaining documented fields were empty in every capture
+    def clean(value):
+        # ", PHISHING" -> "PHISHING"
+        return value.lstrip(", ") if value else None
+
+    reason = clean(_first_param(params, ("reason",)))
+    category = clean(_first_param(params, ("cat",)))
+    return {
+        "blocked url or domain": _first_param(params, ("url",)),
+        "category or reason": reason or category,
+        "user": _first_param(params, ("user",)) or None,
+        "rule/policy name": _first_param(params, ("rule",)) or None,
+        "rule/policy id": None,
+        "device id": None,
+        "keyword": None,
+        "blocked path/query": None,
+        "other decoded context": _join_context(
+            ("cat", category),
+            ("reasoncode", _first_param(params, ("reasoncode",)) or None),
+            ("timebound", _first_param(params, ("timebound",)) or None),
+            ("action", _first_param(params, ("action",)) or None),
+            ("kind", _first_param(params, ("kind",)) or None),
+            ("referer", _first_param(params, ("referer",)) or None),
+            ("zsq", _first_param(params, ("zsq",)) or None),
+        ),
+    }
+
+
+def _decode_circle(url: str, params: dict) -> dict:
+    # filter.meetcircle.com/<profile>/?filtered=<domain>&cat=<name>&catid=<n>
+    # &reason=blocked - the path segment is the profile the policy applied to
+    profile = (urllib.parse.urlsplit(url).path or "").strip("/").split("/")[0] or None
+    return {
+        "blocked url or domain": _first_param(params, ("filtered",)),
+        "category or reason": _first_param(params, ("cat",)),
+        "user": None,
+        "rule/policy name": None,
+        "rule/policy id": None,
+        "device id": None,
+        "keyword": None,
+        "blocked path/query": None,
+        "other decoded context": _join_context(
+            ("profile", profile),
+            ("category id", _first_param(params, ("catid",))),
+            ("reason", _first_param(params, ("reason",))),
+        ),
+    }
+
+
 def _decode_generic(url: str, params: dict) -> dict:
     # fallback for un-evidenced vendors: a conservative guess at the common
     # parameter names, with everything else preserved verbatim
@@ -301,6 +412,9 @@ VENDOR_DECODERS = {
     "Linewize": _decode_linewize,
     "Securly": _decode_securly,
     "BlockSi": _decode_blocksi,
+    "Microsoft Family Safety": _decode_microsoft_family_safety,
+    "eero": _decode_eero,
+    "Circle": _decode_circle,
 }
 
 
@@ -349,7 +463,7 @@ __artifacts__ = (
         "Lightspeed, Microsoft Family Safety, eero, Circle) from history and cache, "
         "decoding the embedded blocked target, reason/category, rule, user and device "
         "details per the vendor URL schemas",
-        "0.2",
+        "0.3",
         get_block_pages,
         ReportPresentation.table,
         timestamp_field_names=("timestamp",)
