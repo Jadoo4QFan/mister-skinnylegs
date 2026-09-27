@@ -38,6 +38,9 @@ plugins against a Chrome, Chromium or Mozilla Firefox Profile Folder.
 | o365_sharepoint_plugin.py | O365-Sharepoint | O365-Sharepoint recent files          | 0.2     | Recovers recent files list and any thumbnails from API responses in the cache for Sharepoint and O365     |
 | o365_sharepoint_plugin.py | O365-Sharepoint | O365-Sharepoint user activity         | 0.2     | Recovers artifacts related to user activity (viewing, editing, downloading, etc.) for Sharepoint and O365 |
 | reddit_plugin.py          | Reddit          | Reddit Chat Messages                  | 0.2     | Recovers Reddit chat messages from the Cache and IndexedDB                                                |
+| roblox_plugin.py          | Roblox          | Roblox Chat Conversations             | 0.1     | Recovers Roblox platform chat conversations (threads) from get-user-conversations responses in the Cache  |
+| roblox_plugin.py          | Roblox          | Roblox Chat Messages                  | 0.1     | Recovers Roblox platform chat messages from get-conversation-messages (and conversation listing) responses in the Cache |
+| roblox_plugin.py          | Roblox          | Roblox Chat Users                     | 0.1     | Recovers Roblox chat participant details from get-user-conversations responses in the Cache               |
 | storage_dump_plugin.py    | Data Dump       | History                               | 0.2     | Dumps History Records                                                                                     |
 | storage_dump_plugin.py    | Data Dump       | Downloads                             | 0.2     | Dumps Download Records                                                                                    |
 | storage_dump_plugin.py    | Data Dump       | Localstorage                          | 0.2     | Dumps Localstorage Records                                                                                |
